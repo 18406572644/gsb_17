@@ -8,6 +8,7 @@ import WebSocket from 'ws'
 import { apply, diffToOp } from '../../shared/ot'
 import type { ServerMsg } from '../../shared/protocol'
 import { OTClient } from '../../client/src/ot/otClient'
+import { createDoc, grant, login } from './helpers'
 
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -17,6 +18,7 @@ process.env.PORT = '18097'
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'collab-itest-'))
 const { server, shutdown } = await import('../src/index')
 
+const BASE_HTTP = 'http://localhost:18097'
 const BASE = 'ws://localhost:18097/ws'
 
 async function waitFor(cond: () => boolean, timeout = 5000, step = 25): Promise<void> {
@@ -37,6 +39,7 @@ class HeadlessClient {
   constructor(
     readonly name: string,
     readonly docId: string,
+    readonly token: string,
   ) {
     this.ot = new OTClient({
       sendOp: (op, opId, revision) => this.send({ type: 'op', op, opId, revision }),
@@ -64,7 +67,7 @@ class HeadlessClient {
       this.ws!.once('open', resolve)
       this.ws!.once('error', reject)
     })
-    this.send({ type: 'join', docId: this.docId, name: this.name, role: 'editor', lastRevision })
+    this.send({ type: 'join', docId: this.docId, token: this.token, lastRevision })
     await waitFor(() => this.ready, 3000)
   }
 
@@ -124,9 +127,12 @@ after(() => {
 })
 
 test('集成: 真实 OTClient 双方并发输入收敛', async () => {
-  const docId = 'itest-concurrent'
-  const a = new HeadlessClient('A', docId)
-  const b = new HeadlessClient('B', docId)
+  const admin = await login(BASE_HTTP, 'admin', 'admin123')
+  const docId = await createDoc(BASE_HTTP, admin.token, 'OT并发')
+  const editorToken = (await login(BASE_HTTP, 'editor', 'editor123')).token
+  await grant(BASE_HTTP, admin.token, docId, 'editor', 'editor')
+  const a = new HeadlessClient('A', docId, admin.token)
+  const b = new HeadlessClient('B', docId, editorToken)
   await a.join()
   await b.join()
 
@@ -146,7 +152,9 @@ test('集成: 真实 OTClient 双方并发输入收敛', async () => {
   assert.equal(a.doc, b.doc)
 
   // 第三方全量加入，文档一致
-  const c = new HeadlessClient('C', docId)
+  const viewerToken = (await login(BASE_HTTP, 'viewer', 'viewer123')).token
+  await grant(BASE_HTTP, admin.token, docId, 'viewer', 'viewer')
+  const c = new HeadlessClient('C', docId, viewerToken)
   await c.join()
   assert.equal(c.doc, a.doc)
 
@@ -156,9 +164,12 @@ test('集成: 真实 OTClient 双方并发输入收敛', async () => {
 })
 
 test('集成: 离线编辑 → 重连增量重同步 → 自动补发收敛', async () => {
-  const docId = 'itest-reconnect'
-  const a = new HeadlessClient('A', docId)
-  const b = new HeadlessClient('B', docId)
+  const admin = await login(BASE_HTTP, 'admin', 'admin123')
+  const docId = await createDoc(BASE_HTTP, admin.token, '离线重连')
+  const editorToken = (await login(BASE_HTTP, 'editor', 'editor123')).token
+  await grant(BASE_HTTP, admin.token, docId, 'editor', 'editor')
+  const a = new HeadlessClient('A', docId, admin.token)
+  const b = new HeadlessClient('B', docId, editorToken)
   await a.join()
   await b.join()
 
@@ -188,8 +199,9 @@ test('集成: 离线编辑 → 重连增量重同步 → 自动补发收敛', as
 })
 
 test('集成: ack 超时触发主动重同步', async () => {
-  const docId = 'itest-ack-timeout'
-  const a = new HeadlessClient('A', docId)
+  const admin = await login(BASE_HTTP, 'admin', 'admin123')
+  const docId = await createDoc(BASE_HTTP, admin.token, 'ack超时')
+  const a = new HeadlessClient('A', docId, admin.token)
   await a.join()
   // 连接静默丢失（不通知 OT 层，模拟上行丢包）：操作被标记已发送但实际未送达
   a.ws!.close()

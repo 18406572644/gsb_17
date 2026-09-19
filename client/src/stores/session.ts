@@ -1,14 +1,20 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import type { Role, UserInfo } from '../../../shared/protocol'
+import { canAnnotate, canEdit, canManage, type Role, type UserInfo } from '../../../shared/protocol'
 import type { ConnStatus } from '@/ws/wsClient'
 
-/** 会话状态：连接、身份、在线用户、远程光标 */
+/** 会话状态：连接、服务端解析的身份与角色、在线用户、远程光标 */
 export const useSessionStore = defineStore('session', () => {
+  /** 是否处于编辑器内（进入工作台后由 collab 置位） */
   const joined = ref(false)
-  const docId = ref('demo')
+  const docId = ref('')
+  const workspaceId = ref('')
+  const docTitle = ref('')
+  /** 当前登录用户的稳定 ID */
+  const userId = ref('')
   const name = ref('')
-  const role = ref<Role>('editor')
+  /** 服务端根据成员关系下发的有效角色（权限实时变更时更新） */
+  const role = ref<Role>('viewer')
   const clientId = ref('')
   const users = ref<UserInfo[]>([])
   const cursors = ref<Record<string, { start: number; end: number }>>({})
@@ -17,8 +23,9 @@ export const useSessionStore = defineStore('session', () => {
   /** 用户手动模拟断网 */
   const simulatedOffline = ref(false)
 
-  const canEdit = computed(() => role.value === 'editor')
-  const canAnnotate = computed(() => role.value === 'editor' || role.value === 'commenter')
+  const canEditDoc = computed(() => canEdit(role.value))
+  const canAnnotateDoc = computed(() => canAnnotate(role.value))
+  const canAdminDoc = computed(() => canManage(role.value))
   const online = computed(() => status.value === 'online')
 
   function setUsers(list: UserInfo[]) {
@@ -32,6 +39,12 @@ export const useSessionStore = defineStore('session', () => {
 
   function $reset() {
     joined.value = false
+    docId.value = ''
+    workspaceId.value = ''
+    docTitle.value = ''
+    userId.value = ''
+    name.value = ''
+    role.value = 'viewer'
     clientId.value = ''
     users.value = []
     cursors.value = {}
@@ -43,6 +56,9 @@ export const useSessionStore = defineStore('session', () => {
   return {
     joined,
     docId,
+    workspaceId,
+    docTitle,
+    userId,
     name,
     role,
     clientId,
@@ -51,8 +67,9 @@ export const useSessionStore = defineStore('session', () => {
     status,
     reconnectAttempt,
     simulatedOffline,
-    canEdit,
-    canAnnotate,
+    canEditDoc,
+    canAnnotateDoc,
+    canAdminDoc,
     online,
     setUsers,
     $reset,

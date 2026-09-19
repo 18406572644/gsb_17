@@ -4,25 +4,45 @@
  */
 import type { Op } from './ot'
 
-/** 角色：viewer 只读 / commenter 可批注 / editor 可编辑+批注 */
-export type Role = 'viewer' | 'commenter' | 'editor'
+/**
+ * 文档级角色（细粒度权限）：
+ * viewer 查看 / commenter 批注 / editor 编辑+批注 / admin 管理（含成员授权，默认兼具编辑权）。
+ * 工作区级角色（admin/member）见 tenant.ts。
+ */
+export type Role = 'viewer' | 'commenter' | 'editor' | 'admin'
 
 export const ROLE_LABEL: Record<Role, string> = {
   viewer: '只读',
   commenter: '批注',
   editor: '编辑',
+  admin: '管理',
+}
+
+/** 角色等级，可比较权限高低（成员管理下拉按此排序） */
+export const ROLE_LEVEL: Record<Role, number> = {
+  viewer: 0,
+  commenter: 1,
+  editor: 2,
+  admin: 3,
 }
 
 export function canEdit(role: Role): boolean {
-  return role === 'editor'
+  return role === 'editor' || role === 'admin'
 }
 
 export function canAnnotate(role: Role): boolean {
-  return role === 'editor' || role === 'commenter'
+  return role === 'editor' || role === 'commenter' || role === 'admin'
+}
+
+/** 管理权限：配置文档成员、查看审计等 */
+export function canManage(role: Role): boolean {
+  return role === 'admin'
 }
 
 export interface UserInfo {
   clientId: string
+  /** 稳定的用户 ID（权限实时变更按此匹配在线连接） */
+  userId: string
   name: string
   role: Role
   color: string
@@ -67,8 +87,8 @@ export interface LogEntry {
 export interface JoinMsg {
   type: 'join'
   docId: string
-  name: string
-  role: Role
+  /** 登录令牌；服务端据此解析用户身份与文档权限，角色不再由客户端自选 */
+  token: string
   /** 断线重连时携带本地已同步到的版本号，用于增量补齐 */
   lastRevision?: number
 }
@@ -140,11 +160,14 @@ export type ClientMsg =
 export interface WelcomeMsg {
   type: 'welcome'
   clientId: string
+  userId: string
   docId: string
+  workspaceId: string
   revision: number
   doc: string
   annotations: Annotation[]
   users: UserInfo[]
+  /** 服务端根据成员关系解析出的当前用户有效角色 */
   role: Role
   /** 重连时若 true 表示服务端日志已不足以增量补齐，本消息为全量快照 */
   snapshot: boolean
@@ -203,11 +226,32 @@ export interface AnnDeletedMsg {
   seq: number
 }
 
+/**
+ * 权限实时变更推送：管理员调整某用户在当前文档的角色后，
+ * 服务端立即推送给该用户的所有在线连接（不占 seq，类似 presence 的易失消息）。
+ * 客户端收到后立即更新权限门禁；若失去编辑权，还需重同步以回滚在途的乐观修改。
+ */
+export interface PermChangedMsg {
+  type: 'perm:changed'
+  docId: string
+  role: Role
+  message: string
+}
+
+/** 文档被删除或当前用户被移除：在线连接收到后应退出编辑器回到工作台 */
+export interface DocClosedMsg {
+  type: 'doc:closed'
+  docId: string
+  reason: string
+}
+
 export type ServerErrorCode =
   | 'PERMISSION_DENIED'
+  | 'UNAUTHENTICATED'
   | 'BAD_REVISION'
   | 'RESYNC_REQUIRED'
   | 'BAD_MESSAGE'
+  | 'NOT_FOUND'
   | 'INTERNAL'
 
 export interface ErrorMsg {
@@ -231,5 +275,7 @@ export type ServerMsg =
   | RemoteCursorMsg
   | AnnUpsertMsg
   | AnnDeletedMsg
+  | PermChangedMsg
+  | DocClosedMsg
   | ErrorMsg
   | PongMsg

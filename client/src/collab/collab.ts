@@ -1,11 +1,16 @@
 /**
  * 协同编排层：把 WSClient（连接）/ OTClient（并发控制）/ Pinia stores（状态）粘合起来。
  *
+ * 多租户要点：
+ * - join 只接收 docId，身份令牌来自 auth store，文档角色完全由服务端在 welcome 中下发；
+ * - 管理员在线调整权限时，服务端推送 perm:changed → 立即更新本地门禁；
+ *   若失去编辑权且存在未确认的乐观修改，主动全量重同步回滚，界面以服务端文档为准；
+ * - 被移出文档 / 文档被删除时收到 doc:closed → 退出编辑器回到工作台。
+ *
  * 异常链路：
  * - 断网：WSClient 指数退避重连 → 重连后带 lastRevision 重新 join → 服务端增量补发或全量快照；
  * - 消息丢失：广播消息携带 seq，客户端检测空洞主动 resync；ack 超时同样触发 resync；
- * - 状态回滚：服务端日志不足以下发增量时下发快照，客户端丢弃未确认修改并回滚到快照；
- * - 权限/协议错误：服务端 error 消息 → 提示并按需 resync。
+ * - 状态回滚：服务端日志不足以下发增量时下发快照，客户端丢弃未确认修改并回滚到快照。
  */
 import { ElMessage } from 'element-plus'
 import { apply, diffToOp, isNoop, mapPosition, type Op } from '../../../shared/ot'
@@ -13,15 +18,20 @@ import type {
   Annotation,
   ErrorMsg,
   OpsMsg,
+  PermChangedMsg,
   RemoteOpMsg,
   Role,
   ServerMsg,
   WelcomeMsg,
 } from '../../../shared/protocol'
+import { canEdit } from '../../../shared/protocol'
 import { WSClient } from '@/ws/wsClient'
 import { OTClient } from '@/ot/otClient'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
+import { useAuthStore } from '@/stores/auth'
+import { useWorkspaceStore } from '@/stores/workspace'
+import { getToken } from '@/api/http'
 
 type RemoteListener = (op: Op) => void
 
@@ -38,6 +48,12 @@ class Collab {
   private cursorTimer: ReturnType<typeof setTimeout> | null = null
   private lastCursorSent = 0
   private joinedOnce = false
+  /** 已发送 join、尚未收到 welcome（用于判定 error 是否为准入拒绝） */
+  private pendingJoin = false
+  /** 被服务端拒绝进入（鉴权/权限）时的回调，工作台据此停留列表页 */
+  onJoinRejected: ((message: string) => void) | null = null
+  /** 文档被关闭/本人被移除时的回调 */
+  onDocClosed: ((reason: string) => void) | null = null
 
   constructor() {
     this.ot = new OTClient({
@@ -56,13 +72,13 @@ class Collab {
       }
     }
     this.ws.onOpen = () => {
-      // 连接建立后立即（重）加入文档，携带本地版本号用于增量补齐
+      // 连接建立后立即（重）加入文档，携带令牌与本地版本号；角色由服务端解析
       const session = useSessionStore()
+      this.pendingJoin = true
       this.ws.send({
         type: 'join',
         docId: session.docId,
-        name: session.name,
-        role: session.role,
+        token: getToken(),
         lastRevision: this.joinedOnce ? this.ot.revision : undefined,
       })
     }
@@ -80,12 +96,16 @@ class Collab {
     }
   }
 
-  join(docId: string, name: string, role: Role) {
+  /** 进入文档：前置的 HTTP 权限加载已在调用方（workspace.openDoc）完成 */
+  join(docId: string) {
     const session = useSessionStore()
+    const workspace = useWorkspaceStore()
     session.docId = docId
-    session.name = name
-    session.role = role
+    session.workspaceId = workspace.currentDoc?.workspaceId || ''
+    session.docTitle = workspace.currentDoc?.title || docId
+    session.name = useAuthStore().displayName
     session.joined = true
+    this.joinedOnce = false
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     this.ws.connect(`${proto}://${location.host}/ws`)
   }
@@ -94,8 +114,10 @@ class Collab {
     this.ws.disconnect()
     this.ws.clearOutbox()
     this.joinedOnce = false
+    this.pendingJoin = false
     useSessionStore().$reset()
     useDocStore().$reset()
+    useWorkspaceStore().clearCurrentDoc()
     this.ot.rollback(0)
     this.lastSeq = 0
   }
@@ -215,6 +237,14 @@ class Collab {
         session.cursors[msg.clientId] = { start: msg.start, end: msg.end }
         break
 
+      case 'perm:changed':
+        this.onPermChanged(msg)
+        break
+
+      case 'doc:closed':
+        this.handleDocClosed(msg.reason)
+        break
+
       case 'error':
         this.onError(msg)
         break
@@ -229,6 +259,11 @@ class Collab {
     const doc = useDocStore()
     const wasRejoin = this.joinedOnce
     session.clientId = msg.clientId
+    session.userId = msg.userId
+    session.workspaceId = msg.workspaceId
+    this.pendingJoin = false
+    // 角色以服务端下发为准（重连后权限可能已变化）
+    session.role = msg.role
     session.setUsers(msg.users)
     this.joinedOnce = true
     this.resyncing = true
@@ -244,7 +279,7 @@ class Collab {
       this.ws.clearOutbox()
       this.finishResync()
       if (hadUnsynced) {
-        ElMessage.warning('连接已恢复，但部分未同步的本地修改已回滚（版本过旧）')
+        ElMessage.warning('连接已恢复，但部分未同步的本地修改已回滚（版本过旧或权限不足）')
       } else if (wasRejoin) {
         ElMessage.success('已重新连接并同步到最新版本')
       }
@@ -253,6 +288,32 @@ class Collab {
       doc.annotations = msg.annotations
       if (wasRejoin) ElMessage.success('连接已恢复，正在增量同步')
     }
+  }
+
+  /** 权限实时变更：更新门禁；失去编辑权时回滚在途的乐观修改 */
+  private onPermChanged(msg: PermChangedMsg) {
+    const session = useSessionStore()
+    const oldRole: Role = session.role
+    session.role = msg.role
+    const workspace = useWorkspaceStore()
+    if (workspace.permission) workspace.permission = { ...workspace.permission, role: msg.role }
+
+    if (!canEdit(msg.role) && canEdit(oldRole)) {
+      ElMessage.warning(msg.message || '你的编辑权限已被调整')
+      // 编辑权被收回：丢弃尚未确认的本地编辑，并以服务端全量文档为准
+      this.ws.clearOutbox()
+      this.forceSnapshotResync()
+    } else {
+      ElMessage.info(msg.message || '文档权限已更新')
+    }
+  }
+
+  /** 被移出文档 / 文档被删除：退出编辑器 */
+  private handleDocClosed(reason: string) {
+    ElMessage.warning(reason || '文档已关闭')
+    const cb = this.onDocClosed
+    this.leave()
+    cb?.(reason)
   }
 
   /** 重同步完成：重放本地未确认操作对批注锚点的影响，补发离线队列，恢复状态 */
@@ -287,10 +348,42 @@ class Collab {
     this.ws.send({ type: 'resync', lastRevision: this.ot.revision })
   }
 
-  private onError(msg: ErrorMsg) {
+  /** 强制全量快照重同步（lastRevision=-1 使服务端直接下发快照） */
+  private forceSnapshotResync() {
+    this.resyncing = true
+    const doc = useDocStore()
+    doc.syncState = 'resyncing'
+    this.ot.rollback(this.ot.revision) // 丢弃所有未确认的乐观编辑
+    this.ws.send({ type: 'resync', lastRevision: -1 })
+  }
+
+  private async onError(msg: ErrorMsg) {
     switch (msg.code) {
+      case 'UNAUTHENTICATED':
+        ElMessage.error(msg.message || '登录已失效，请重新登录')
+        // 令牌失效：清除登录态并退出，回到登录页
+        await useAuthStore().logout()
+        this.handleDocClosed(msg.message || '登录已失效')
+        break
       case 'PERMISSION_DENIED':
+        if (msg.opId) {
+          // 编辑操作被拒（如在途操作遭遇在线降权）：以服务端文档为准回滚本地乐观修改
+          ElMessage.error(msg.message)
+          this.forceSnapshotResync()
+        } else if (this.pendingJoin) {
+          // join 阶段被拒（首次进入或重连时已无权限）：退回工作台/登录页
+          ElMessage.error(msg.message)
+          const cb = this.onJoinRejected
+          this.leave()
+          cb?.(msg.message)
+        } else {
+          // 运行期批注等操作被拒（如离线期间被降权，队列补发失败）：仅提示
+          ElMessage.error(msg.message)
+        }
+        break
+      case 'NOT_FOUND':
         ElMessage.error(msg.message)
+        this.handleDocClosed(msg.message)
         break
       case 'RESYNC_REQUIRED':
       case 'BAD_REVISION':

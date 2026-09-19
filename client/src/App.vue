@@ -1,15 +1,23 @@
 <script setup lang="ts">
+import { onMounted } from 'vue'
+import { useAuthStore } from '@/stores/auth'
 import { useSessionStore } from '@/stores/session'
 import LoginGate from '@/components/LoginGate.vue'
+import WorkspaceView from '@/components/WorkspaceView.vue'
 import TopBar from '@/components/TopBar.vue'
 import EditorView from '@/components/EditorView.vue'
 import AnnotationPanel from '@/components/AnnotationPanel.vue'
 
+const auth = useAuthStore()
 const session = useSessionStore()
+
+onMounted(() => auth.bootstrap())
 </script>
 
 <template>
-  <LoginGate v-if="!session.joined" />
+  <div v-if="!auth.bootstrapped" v-loading="true" class="app-boot" element-loading-text="正在恢复登录态…" />
+  <LoginGate v-else-if="!auth.isLoggedIn" />
+  <WorkspaceView v-else-if="!session.joined" />
   <div v-else class="app-shell">
     <TopBar />
     <el-alert

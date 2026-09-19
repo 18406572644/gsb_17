@@ -143,6 +143,7 @@ function measurePos(pos: number): { top: number; left: number } {
 
 function onInput() {
   if (composing) return
+  if (!session.canEditDoc) return
   const ta = taRef.value
   if (!ta) return
   collab.localEdit(ta.value)
@@ -174,7 +175,7 @@ function reportSelection() {
 
 function updateAnnFab() {
   if (annPopVisible.value) return
-  if (doc.selection && session.canAnnotate) {
+  if (doc.selection && session.canAnnotateDoc) {
     const p = measurePos(doc.selection.end)
     const ta = taRef.value!
     const wrap = wrapRef.value!
@@ -261,8 +262,8 @@ watch(
       ref="taRef"
       class="editor-textarea"
       :value="doc.text"
-      :readonly="!session.canEdit"
-      :placeholder="session.canEdit ? '开始输入，内容将实时同步给协作者…' : '当前身份为只读/批注，无法编辑正文'"
+      :readonly="!session.canEditDoc"
+      :placeholder="session.canEditDoc ? '开始输入，内容将实时同步给协作者…' : '当前角色为只读/批注，无法编辑正文'"
       spellcheck="false"
       @input="onInput"
       @scroll="syncScroll"

@@ -7,20 +7,22 @@ import type { ServerMsg, WelcomeMsg } from '../../shared/protocol'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createDoc, grant, http, login, setupDoc } from './helpers'
 
 process.env.PORT = '18099'
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'collab-e2e-'))
 const { server, shutdown } = await import('../src/index')
 
+const BASE_HTTP = 'http://localhost:18099'
 const BASE = 'ws://localhost:18099/ws'
 
 /** 一个忠实的迷你客户端：实现与服务端对应的 OT 客户端算法 */
 class TestClient {
   ws: WebSocket
-  name: string
-  role: string
+  token: string
   docId: string
   clientId = ''
+  userId = ''
   doc = ''
   revision = 0
   pending: { opId: string; op: Op } | null = null
@@ -28,9 +30,8 @@ class TestClient {
   private waiters: { pred: (m: ServerMsg) => boolean; resolve: (m: ServerMsg) => void }[] = []
   private opCounter = 0
 
-  constructor(name: string, role: string, docId: string) {
-    this.name = name
-    this.role = role
+  constructor(token: string, docId: string) {
+    this.token = token
     this.docId = docId
     this.ws = new WebSocket(BASE)
     this.ws.on('message', (raw) => {
@@ -53,6 +54,7 @@ class TestClient {
       case 'welcome': {
         const w = msg as WelcomeMsg
         this.clientId = w.clientId
+        this.userId = w.userId
         if (w.snapshot) {
           this.doc = w.doc
           this.revision = w.revision
@@ -108,7 +110,7 @@ class TestClient {
 
   async join(lastRevision?: number) {
     await this.open()
-    this.send({ type: 'join', docId: this.docId, name: this.name, role: this.role, lastRevision })
+    this.send({ type: 'join', docId: this.docId, token: this.token, lastRevision })
     await this.waitFor((m) => m.type === 'welcome')
   }
 
@@ -118,7 +120,7 @@ class TestClient {
 
   /** 本地编辑：乐观应用并发送 */
   edit(op: Op) {
-    const opId = `${this.name}-${this.opCounter++}`
+    const opId = `${this.userId}-${this.opCounter++}`
     this.doc = apply(this.doc, op)
     this.pending = { opId, op }
     this.send({ type: 'op', revision: this.revision, op, opId })
@@ -145,8 +147,6 @@ class TestClient {
   }
 }
 
-let serverDoc = ''
-
 before(async () => {
   await new Promise<void>((r) => (server.listening ? r() : server.once('listening', r)))
 })
@@ -156,9 +156,16 @@ after(() => {
 })
 
 test('e2e: 双客户端并发编辑收敛', async () => {
-  const docId = 'e2e-concurrent'
-  const a = new TestClient('A', 'editor', docId)
-  const b = new TestClient('B', 'editor', docId)
+  const { docId, tokens } = await setupDoc(
+    BASE_HTTP,
+    [
+      { username: 'editor', role: 'editor' },
+      { username: 'commenter', role: 'editor' },
+    ],
+    '并发文档',
+  )
+  const a = new TestClient(tokens.admin, docId)
+  const b = new TestClient(tokens.editor, docId)
   await a.join()
   await b.join()
 
@@ -179,20 +186,28 @@ test('e2e: 双客户端并发编辑收敛', async () => {
   assert.equal(b.revision, 2)
 
   // 新加入的客户端拿到一致的全量文档
-  const c = new TestClient('C', 'viewer', docId)
+  const viewer = await login(BASE_HTTP, 'viewer', 'viewer123')
+  await grant(BASE_HTTP, tokens.admin, docId, 'viewer', 'viewer')
+  const c = new TestClient(viewer.token, docId)
   await c.join()
   assert.equal(c.doc, a.doc)
-  serverDoc = a.doc
   a.close()
   b.close()
   c.close()
 })
 
 test('e2e: 权限控制 —— 只读不可编辑/批注，批注者可批注不可编辑', async () => {
-  const docId = 'e2e-perm'
-  const editor = new TestClient('E', 'editor', docId)
-  const viewer = new TestClient('V', 'viewer', docId)
-  const commenter = new TestClient('M', 'commenter', docId)
+  const { docId, tokens } = await setupDoc(
+    BASE_HTTP,
+    [
+      { username: 'viewer', role: 'viewer' },
+      { username: 'commenter', role: 'commenter' },
+    ],
+    '权限文档',
+  )
+  const editor = new TestClient(tokens.admin, docId)
+  const viewer = new TestClient(tokens.viewer, docId)
+  const commenter = new TestClient(tokens.commenter, docId)
   await editor.join()
   await viewer.join()
   await commenter.join()
@@ -226,7 +241,7 @@ test('e2e: 权限控制 —— 只读不可编辑/批注，批注者可批注不
   // 编辑导致批注锚点移动：在位置 0 插入 2 个字符 → [1,3) → [3,5)
   editor.edit([{ insert: '>>' }, { retain: 6 }])
   await editor.waitFor((m) => m.type === 'ack')
-  const fresh = new TestClient('F', 'viewer', docId)
+  const fresh = new TestClient(tokens.viewer, docId)
   await fresh.join()
   const welcome = fresh.inbox.find((m) => m.type === 'welcome') as WelcomeMsg
   const ann = welcome.annotations.find((x) => x.id === 'ann-1')!
@@ -240,9 +255,9 @@ test('e2e: 权限控制 —— 只读不可编辑/批注，批注者可批注不
 })
 
 test('e2e: 断线重连 —— 增量补齐错过的操作', async () => {
-  const docId = 'e2e-reconnect'
-  const a = new TestClient('A', 'editor', docId)
-  const b = new TestClient('B', 'editor', docId)
+  const { docId, tokens } = await setupDoc(BASE_HTTP, [{ username: 'editor', role: 'editor' }], '重连文档')
+  const a = new TestClient(tokens.admin, docId)
+  const b = new TestClient(tokens.editor, docId)
   await a.join()
   await b.join()
 
@@ -260,7 +275,7 @@ test('e2e: 断线重连 —— 增量补齐错过的操作', async () => {
   await a.waitFor((m) => m.type === 'ack' && (m as { revision: number }).revision === 3)
 
   // B 重连并携带旧版本号 → 收到增量 ops
-  const b2 = new TestClient('B', 'editor', docId)
+  const b2 = new TestClient(tokens.editor, docId)
   b2.doc = b.doc // 模拟本地保留的文档
   b2.revision = bRev
   await b2.join(bRev)
@@ -276,14 +291,16 @@ test('e2e: 断线重连 —— 增量补齐错过的操作', async () => {
 })
 
 test('e2e: 版本过旧 —— 回退全量快照', async () => {
-  const docId = 'e2e-snapshot'
-  const a = new TestClient('A', 'editor', docId)
+  const { docId, tokens } = await setupDoc(BASE_HTTP, [], '快照文档')
+  const a = new TestClient(tokens.admin, docId)
   await a.join()
   a.edit([{ insert: 'snap' }])
   await a.waitFor((m) => m.type === 'ack')
 
   // lastRevision = -1 → 全量快照
-  const b = new TestClient('B', 'editor', docId)
+  const editorToken = (await login(BASE_HTTP, 'editor', 'editor123')).token
+  await grant(BASE_HTTP, tokens.admin, docId, 'editor', 'editor')
+  const b = new TestClient(editorToken, docId)
   await b.join(-1)
   const w = b.inbox.find((m) => m.type === 'welcome') as WelcomeMsg
   assert.equal(w.snapshot, true)
@@ -293,26 +310,70 @@ test('e2e: 版本过旧 —— 回退全量快照', async () => {
 })
 
 test('e2e: 重复 opId 幂等（ack 丢失重发不重复应用）', async () => {
-  const docId = 'e2e-idempotent'
-  const a = new TestClient('A', 'editor', docId)
+  const { docId, tokens } = await setupDoc(BASE_HTTP, [], '幂等文档')
+  const a = new TestClient(tokens.admin, docId)
   await a.join()
   a.send({ type: 'op', revision: 0, op: [{ insert: 'x' }], opId: 'dup-1' })
   await a.waitFor((m) => m.type === 'ack')
   // 模拟 ack 丢失后客户端重发同一操作
   a.send({ type: 'op', revision: 0, op: [{ insert: 'x' }], opId: 'dup-1' })
   await new Promise((r) => setTimeout(r, 300))
-  const b = new TestClient('B', 'viewer', docId)
+  const viewerToken = (await login(BASE_HTTP, 'viewer', 'viewer123')).token
+  await grant(BASE_HTTP, tokens.admin, docId, 'viewer', 'viewer')
+  const b = new TestClient(viewerToken, docId)
   await b.join()
   assert.equal(b.doc, 'x') // 只被应用了一次
   a.close()
   b.close()
 })
 
+test('e2e: 无令牌 / 无权访问被拒绝', async () => {
+  const admin = await login(BASE_HTTP, 'admin', 'admin123')
+  const docId = await createDoc(BASE_HTTP, admin.token, '隔离文档')
+
+  // 无令牌 join → UNAUTHENTICATED，不发送 welcome
+  const ws1 = new WebSocket(BASE)
+  await new Promise<void>((r) => ws1.once('open', r))
+  ws1.send(JSON.stringify({ type: 'join', docId, token: 'bogus' }))
+  const err1 = await new Promise<ServerMsg>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('超时')), 3000)
+    ws1.on('message', (raw) => {
+      const m = JSON.parse(raw.toString())
+      if (m.type === 'error') {
+        clearTimeout(t)
+        resolve(m)
+      }
+    })
+  })
+  assert.equal((err1 as { code: string }).code, 'UNAUTHENTICATED')
+  ws1.close()
+
+  // commenter 未被授权该文档 → PERMISSION_DENIED
+  const commenter = await login(BASE_HTTP, 'commenter', 'commenter123')
+  const ws2 = new WebSocket(BASE)
+  await new Promise<void>((r) => ws2.once('open', r))
+  ws2.send(JSON.stringify({ type: 'join', docId, token: commenter.token }))
+  const err2 = await new Promise<ServerMsg>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('超时')), 3000)
+    ws2.on('message', (raw) => {
+      const m = JSON.parse(raw.toString())
+      if (m.type === 'error') {
+        clearTimeout(t)
+        resolve(m)
+      }
+    })
+  })
+  assert.equal((err2 as { code: string }).code, 'PERMISSION_DENIED')
+  ws2.close()
+})
+
 test('e2e: 畸形消息不炸服务器', async () => {
+  const admin = await login(BASE_HTTP, 'admin', 'admin123')
+  const docId = await createDoc(BASE_HTTP, admin.token, '健壮性文档')
   const ws = new WebSocket(BASE)
   await new Promise<void>((r) => ws.once('open', r))
   ws.send('not-json{{{')
-  ws.send(JSON.stringify({ type: 'join', docId: 'e2e-robust', name: 'R', role: 'editor' }))
+  ws.send(JSON.stringify({ type: 'join', docId, token: admin.token }))
   const welcome = await new Promise<ServerMsg>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('超时')), 3000)
     ws.on('message', (raw) => {
@@ -325,4 +386,17 @@ test('e2e: 畸形消息不炸服务器', async () => {
   })
   assert.equal(welcome.type, 'welcome')
   ws.close()
+})
+
+test('e2e: HTTP 层租户隔离 —— 未登录/越权接口返回 401/403', async () => {
+  const noAuth = await http(BASE_HTTP, '/api/workspaces')
+  assert.equal(noAuth.status, 401)
+
+  const viewer = await login(BASE_HTTP, 'viewer', 'viewer123')
+  // 普通成员不能添加工作区成员
+  const add = await http(BASE_HTTP, '/api/workspaces/demo-ws/members', 'POST', { username: 'editor' }, viewer.token)
+  assert.equal(add.status, 403)
+  // 不存在的文档
+  const missing = await http(BASE_HTTP, '/api/docs/nope', 'GET', undefined, viewer.token)
+  assert.equal(missing.status, 404)
 })

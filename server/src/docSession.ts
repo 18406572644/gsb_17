@@ -25,6 +25,8 @@ const COLORS = [
 
 export interface ClientState {
   clientId: string
+  /** 稳定用户 ID（同一用户多标签页会有多条连接） */
+  userId: string
   name: string
   role: Role
   color: string
@@ -44,7 +46,6 @@ export class DocSession {
   /** 已接受的 opId 集合（幂等去重：ack 丢失导致客户端重发时不重复应用） */
   private acceptedOpIds = new Set<string>()
   private acceptedOpIdQueue: string[] = []
-  private colorIdx = 0
   /** 数据变更回调（用于持久化防抖） */
   onDirty: (() => void) | null = null
 
@@ -57,12 +58,19 @@ export class DocSession {
     this.onDirty?.()
   }
 
-  addClient(clientId: string, name: string, role: Role, send: (msg: object) => void): ClientState {
+  addClient(
+    clientId: string,
+    userId: string,
+    name: string,
+    role: Role,
+    send: (msg: object) => void,
+  ): ClientState {
     const state: ClientState = {
       clientId,
+      userId,
       name: name.slice(0, 24) || '匿名',
       role,
-      color: COLORS[this.colorIdx++ % COLORS.length],
+      color: COLORS[this.userColorIndex(userId)],
       cursor: null,
       send,
     }
@@ -70,17 +78,59 @@ export class DocSession {
     return state
   }
 
+  /** 同一用户在所有连接上使用稳定颜色（多标签页颜色一致） */
+  private userColorIndex(userId: string): number {
+    let h = 0
+    for (let i = 0; i < userId.length; i++) h = (h * 31 + userId.charCodeAt(i)) | 0
+    return Math.abs(h) % COLORS.length
+  }
+
   removeClient(clientId: string) {
     this.clients.delete(clientId)
   }
 
+  /**
+   * 实时权限调整：更新某用户全部在线连接的角色。
+   * 返回受影响的连接（index.ts 负责向其推送 perm:changed）。
+   */
+  updateUserRole(userId: string, role: Role): ClientState[] {
+    const affected: ClientState[] = []
+    for (const c of this.clients.values()) {
+      if (c.userId !== userId || c.role === role) continue
+      c.role = role
+      affected.push(c)
+    }
+    return affected
+  }
+
+  /** 移除某用户的全部在线连接（被移出文档/工作区时） */
+  removeUser(userId: string): ClientState[] {
+    const removed: ClientState[] = []
+    for (const c of [...this.clients.values()]) {
+      if (c.userId === userId) {
+        removed.push(c)
+        this.clients.delete(c.clientId)
+      }
+    }
+    return removed
+  }
+
+  /** 某用户当前是否在本文档在线 */
+  isUserOnline(userId: string): boolean {
+    for (const c of this.clients.values()) if (c.userId === userId) return true
+    return false
+  }
+
   users(): UserInfo[] {
-    return [...this.clients.values()].map((c) => ({
-      clientId: c.clientId,
-      name: c.name,
-      role: c.role,
-      color: c.color,
-    }))
+    // 同一用户多标签页只显示一个头像
+    const seen = new Set<string>()
+    const list: UserInfo[] = []
+    for (const c of this.clients.values()) {
+      if (seen.has(c.userId)) continue
+      seen.add(c.userId)
+      list.push({ clientId: c.clientId, userId: c.userId, name: c.name, role: c.role, color: c.color })
+    }
+    return list
   }
 
   /** 向除 exclude 外的所有客户端广播 */
@@ -201,7 +251,7 @@ export class DocSession {
       end,
       orphan: start === end,
       quote: (msg.quote || this.doc.slice(start, end)).slice(0, 200),
-      authorId: client.clientId,
+      authorId: client.userId,
       authorName: client.name,
       text: msg.text.trim().slice(0, 2000),
       replies: [],
@@ -228,7 +278,7 @@ export class DocSession {
     }
     ann.replies.push({
       id: msg.replyId,
-      authorId: client.clientId,
+      authorId: client.userId,
       authorName: client.name,
       text: msg.text.trim().slice(0, 2000),
       createdAt: Date.now(),
@@ -261,8 +311,8 @@ export class DocSession {
   ): { code: 'PERMISSION_DENIED' | 'BAD_MESSAGE'; message: string } | null {
     const ann = this.annotations.get(annId)
     if (!ann) return { code: 'BAD_MESSAGE', message: '批注不存在' }
-    // 仅作者本人或编辑者可删除
-    if (ann.authorId !== client.clientId && !canEdit(client.role)) {
+    // 仅作者本人或可编辑者（编辑/管理）可删除
+    if (ann.authorId !== client.userId && !canEdit(client.role)) {
       return { code: 'PERMISSION_DENIED', message: '仅作者或编辑者可删除批注' }
     }
     this.annotations.delete(annId)

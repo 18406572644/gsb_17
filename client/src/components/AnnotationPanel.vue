@@ -42,7 +42,7 @@ async function remove(ann: Annotation) {
 }
 
 function canDelete(ann: Annotation) {
-  return ann.authorId === session.clientId || session.canEdit
+  return ann.authorId === session.userId || session.canEditDoc
 }
 
 function reply(ann: Annotation) {
@@ -72,7 +72,7 @@ function reply(ann: Annotation) {
 
     <div class="ann-list">
       <div v-if="filtered.length === 0" class="ann-empty">
-        <template v-if="session.canAnnotate">选中正文文字即可添加批注</template>
+        <template v-if="session.canAnnotateDoc">选中正文文字即可添加批注</template>
         <template v-else>暂无批注</template>
       </div>
 
@@ -103,13 +103,13 @@ function reply(ann: Annotation) {
 
         <div class="ann-actions" @click.stop>
           <el-button size="small" text @click="locate(ann)">定位</el-button>
-          <el-button v-if="session.canAnnotate" size="small" text type="success" @click="toggleResolve(ann)">
+          <el-button v-if="session.canAnnotateDoc" size="small" text type="success" @click="toggleResolve(ann)">
             {{ ann.resolved ? '重开' : '解决' }}
           </el-button>
           <el-button v-if="canDelete(ann)" size="small" text type="danger" @click="remove(ann)">删除</el-button>
         </div>
 
-        <div v-if="session.canAnnotate" class="ann-replies" @click.stop>
+        <div v-if="session.canAnnotateDoc" class="ann-replies" @click.stop>
           <el-input
             v-model="replyDrafts[ann.id]"
             size="small"
