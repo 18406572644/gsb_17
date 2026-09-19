@@ -25,6 +25,7 @@ export class WSClient {
   status: ConnStatus = 'offline'
   onStatus: (status: ConnStatus, attempt: number) => void = () => {}
   onOpen: () => void = () => {}
+  onClose: (code: number, reason: string) => void = () => {}
   onMessage: (msg: unknown) => void = () => {}
 
   get isOpen() {
@@ -74,10 +75,20 @@ export class WSClient {
       }
       this.onMessage(msg)
     }
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       this.stopHeartbeat()
-      if (!this.manualClose) this.scheduleReconnect()
-      else this.setStatus('offline', 0)
+      // 服务端因鉴权失败（4001）或权限收回（4003）主动关闭：不自动重连
+      const policyClose = ev.code === 4001 || ev.code === 4003
+      if (policyClose) {
+        this.manualClose = true
+        this.setStatus('offline', 0)
+        this.onClose(ev.code, ev.reason)
+      } else if (!this.manualClose) {
+        this.scheduleReconnect()
+      } else {
+        this.setStatus('offline', 0)
+        this.onClose(ev.code, ev.reason)
+      }
     }
     ws.onerror = () => {
       // 交由 onclose 统一处理重连
@@ -127,6 +138,11 @@ export class WSClient {
 
   clearOutbox() {
     this.outbox = []
+  }
+
+  /** 裁剪发送队列：移除满足 predicate 的消息（降权后丢弃不再允许的在途批注等） */
+  pruneOutbox(shouldRemove: (msg: { type?: string }) => boolean) {
+    this.outbox = this.outbox.filter((m) => !shouldRemove(m as { type?: string }))
   }
 
   private startHeartbeat() {

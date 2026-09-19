@@ -8,16 +8,18 @@ import WebSocket from 'ws'
 import { apply, diffToOp } from '../../shared/ot'
 import type { ServerMsg } from '../../shared/protocol'
 import { OTClient } from '../../client/src/ot/otClient'
+import { setupScenario, type Creds, type Scenario } from './helpers'
 
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+const HTTP_BASE = 'http://localhost:18097'
+const WS_BASE = 'ws://localhost:18097/ws'
+
 process.env.PORT = '18097'
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'collab-itest-'))
 const { server, shutdown } = await import('../src/index')
-
-const BASE = 'ws://localhost:18097/ws'
 
 async function waitFor(cond: () => boolean, timeout = 5000, step = 25): Promise<void> {
   const t0 = Date.now()
@@ -27,17 +29,17 @@ async function waitFor(cond: () => boolean, timeout = 5000, step = 25): Promise<
   }
 }
 
-/** 无头客户端：与 collab.ts 相同的接线方式（OTClient + 消息分发） */
+/** 无头客户端：与 collab.ts 相同的接线方式（OTClient + 令牌 join + 消息分发） */
 class HeadlessClient {
   doc = ''
   ws: WebSocket | null = null
   ot: OTClient
   resyncCount = 0
+  private workspaceId = ''
+  private docId = ''
+  private ready = false
 
-  constructor(
-    readonly name: string,
-    readonly docId: string,
-  ) {
+  constructor(readonly creds: Creds) {
     this.ot = new OTClient({
       sendOp: (op, opId, revision) => this.send({ type: 'op', op, opId, revision }),
       applyRemote: (op) => {
@@ -55,20 +57,30 @@ class HeadlessClient {
   get revision() {
     return this.ot.revision
   }
+  get isReady() {
+    return this.ready
+  }
 
-  async join(lastRevision?: number) {
-    this.ws = new WebSocket(BASE)
+  async join(scn: Scenario, lastRevision?: number) {
+    this.workspaceId = scn.workspaceId
+    this.docId = scn.docId
+    this.ready = false
+    this.ws = new WebSocket(WS_BASE)
     this.ws.on('message', (raw) => this.handle(JSON.parse(raw.toString()) as ServerMsg))
     this.ws.on('error', () => {})
     await new Promise<void>((resolve, reject) => {
       this.ws!.once('open', resolve)
       this.ws!.once('error', reject)
     })
-    this.send({ type: 'join', docId: this.docId, name: this.name, role: 'editor', lastRevision })
+    this.send({
+      type: 'join',
+      workspaceId: this.workspaceId,
+      docId: this.docId,
+      token: this.creds.token,
+      lastRevision,
+    })
     await waitFor(() => this.ready, 3000)
   }
-
-  private ready = false
 
   private handle(msg: ServerMsg) {
     switch (msg.type) {
@@ -124,11 +136,13 @@ after(() => {
 })
 
 test('集成: 真实 OTClient 双方并发输入收敛', async () => {
-  const docId = 'itest-concurrent'
-  const a = new HeadlessClient('A', docId)
-  const b = new HeadlessClient('B', docId)
-  await a.join()
-  await b.join()
+  const scn = await setupScenario(HTTP_BASE)
+  await scn.grant(scn.members.m1, 'editor')
+  await scn.grant(scn.members.m2, 'editor')
+  const a = new HeadlessClient(scn.members.m1)
+  const b = new HeadlessClient(scn.members.m2)
+  await a.join(scn)
+  await b.join(scn)
 
   // 同步块内背靠背输入：真正并发
   a.type('aaa', 0)
@@ -146,8 +160,9 @@ test('集成: 真实 OTClient 双方并发输入收敛', async () => {
   assert.equal(a.doc, b.doc)
 
   // 第三方全量加入，文档一致
-  const c = new HeadlessClient('C', docId)
-  await c.join()
+  await scn.grant(scn.members.m3, 'viewer')
+  const c = new HeadlessClient(scn.members.m3)
+  await c.join(scn)
   assert.equal(c.doc, a.doc)
 
   a.close()
@@ -156,11 +171,13 @@ test('集成: 真实 OTClient 双方并发输入收敛', async () => {
 })
 
 test('集成: 离线编辑 → 重连增量重同步 → 自动补发收敛', async () => {
-  const docId = 'itest-reconnect'
-  const a = new HeadlessClient('A', docId)
-  const b = new HeadlessClient('B', docId)
-  await a.join()
-  await b.join()
+  const scn = await setupScenario(HTTP_BASE)
+  await scn.grant(scn.members.m1, 'editor')
+  await scn.grant(scn.members.m2, 'editor')
+  const a = new HeadlessClient(scn.members.m1)
+  const b = new HeadlessClient(scn.members.m2)
+  await a.join(scn)
+  await b.join(scn)
 
   a.type('hello ')
   await waitFor(() => a.ot.pendingCount === 0 && b.revision === 1)
@@ -174,7 +191,7 @@ test('集成: 离线编辑 → 重连增量重同步 → 自动补发收敛', as
   await waitFor(() => b.ot.pendingCount === 0)
 
   // A 重连：携带旧版本号，服务端增量补发 B 的操作，A 的离线操作重放后补发
-  await a.join(savedRevision)
+  await a.join(scn, savedRevision)
   await waitFor(() => a.ot.pendingCount === 0 && b.ot.pendingCount === 0)
   await waitFor(() => a.revision === b.revision)
 
@@ -188,9 +205,10 @@ test('集成: 离线编辑 → 重连增量重同步 → 自动补发收敛', as
 })
 
 test('集成: ack 超时触发主动重同步', async () => {
-  const docId = 'itest-ack-timeout'
-  const a = new HeadlessClient('A', docId)
-  await a.join()
+  const scn = await setupScenario(HTTP_BASE)
+  await scn.grant(scn.members.m1, 'editor')
+  const a = new HeadlessClient(scn.members.m1)
+  await a.join(scn)
   // 连接静默丢失（不通知 OT 层，模拟上行丢包）：操作被标记已发送但实际未送达
   a.ws!.close()
   a.type('x')

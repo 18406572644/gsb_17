@@ -5,44 +5,56 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { DocSession, type ClientState } from './docSession'
+import { Hub, CLOSE_REVOKED } from './hub'
+import { TenantStore } from './tenants'
+import { ApiError } from './errors'
 import type { ClientMsg, ServerMsg } from '../../shared/protocol'
+import type {
+  AddMemberRequest,
+  CreateDocRequest,
+  CreateWorkspaceRequest,
+  LoginRequest,
+  RegisterRequest,
+  SetDocPermissionRequest,
+  UpdateMemberRoleRequest,
+} from '../../shared/api'
 
 const PORT = Number(process.env.PORT || 8080)
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..')
 const DATA_DIR = process.env.DATA_DIR || join(ROOT, 'data')
 const CLIENT_DIST = join(ROOT, '..', 'client', 'dist')
 
-const DEFAULT_DOC = `# 多人协同批注编辑器（演示文档）
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true })
 
-本文档支持多人同时编辑与批注。你可以：
+/* ---------------- 多租户存储 + 会话注册表 ---------------- */
 
-1. 以「编辑」身份直接修改正文，所有修改通过 OT 算法实时合并；
-2. 以「批注」身份选中文字后添加批注，批注锚点会随编辑自动移动；
-3. 以「只读」身份旁观整个协作过程；
-4. 点击工具栏「模拟断线」体验断网重连与状态回滚。
+const tenants = new TenantStore(join(DATA_DIR, 'tenants.json'))
+tenants.bootstrap()
 
-试着再开几个浏览器标签页，用不同身份加入同一文档吧。
-`
+const hub = new Hub()
 
-/* ---------------- 文档会话管理 + 持久化 ---------------- */
+/* ---------------- 文档会话管理 + 内容持久化 ---------------- */
 
 const sessions = new Map<string, DocSession>()
 const persistTimers = new Map<string, NodeJS.Timeout>()
 
-if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true })
-
-function dataFile(docId: string) {
-  return join(DATA_DIR, `${encodeURIComponent(docId)}.json`)
+function sessionKey(workspaceId: string, docId: string) {
+  return `${workspaceId}/${docId}`
 }
 
-function schedulePersist(session: DocSession) {
-  if (persistTimers.has(session.docId)) return
+function contentFile(key: string) {
+  // workspaceId / docId 均为 UUID（仅含十六进制与连字符），直接拼文件名
+  return join(DATA_DIR, `doc-${key.replace(/\//g, '_')}.json`)
+}
+
+function schedulePersist(key: string, session: DocSession) {
+  if (persistTimers.has(key)) return
   persistTimers.set(
-    session.docId,
+    key,
     setTimeout(() => {
-      persistTimers.delete(session.docId)
+      persistTimers.delete(key)
       try {
-        writeFileSync(dataFile(session.docId), JSON.stringify(session.serialize(), null, 2))
+        writeFileSync(contentFile(key), JSON.stringify(session.serialize(), null, 2))
       } catch (e) {
         console.error('[persist] 写入失败:', e)
       }
@@ -50,27 +62,42 @@ function schedulePersist(session: DocSession) {
   )
 }
 
-function getSession(docId: string): DocSession {
-  let s = sessions.get(docId)
+function getSession(workspaceId: string, docId: string): DocSession {
+  const key = sessionKey(workspaceId, docId)
+  let s = sessions.get(key)
   if (s) return s
-  const file = dataFile(docId)
+  const file = contentFile(key)
   if (existsSync(file)) {
     try {
       s = DocSession.deserialize(JSON.parse(readFileSync(file, 'utf8')))
-      console.log(`[doc] 从磁盘恢复文档 ${docId} (rev=${s.revision})`)
+      console.log(`[doc] 从磁盘恢复 ${key} (rev=${s.revision})`)
     } catch (e) {
       console.error('[doc] 恢复失败，使用空文档:', e)
       s = new DocSession(docId, '')
     }
   } else {
-    s = new DocSession(docId, docId === 'demo' ? DEFAULT_DOC : '')
+    // 全新文档：使用首次播种的初始内容（若有），否则空文档
+    const seed = tenants.seedContent.get(docId)?.content
+    s = new DocSession(docId, seed ?? '')
   }
-  s.onDirty = () => schedulePersist(s!)
-  sessions.set(docId, s)
+  s.onDirty = () => {
+    schedulePersist(key, s!)
+    tenants.markDocActivity(workspaceId, docId)
+  }
+  sessions.set(key, s)
   return s
 }
 
-/* ---------------- HTTP：健康检查 + 生产模式静态托管 ---------------- */
+// 全新播种的文档内容立即落盘，避免「播种后、首次打开前重启」导致初始内容丢失
+for (const [docId, { workspaceId }] of tenants.seedContent) {
+  const key = sessionKey(workspaceId, docId)
+  const s = getSession(workspaceId, docId)
+  writeFileSync(contentFile(key), JSON.stringify(s.serialize(), null, 2))
+  void s
+}
+tenants.seedContent.clear()
+
+/* ---------------- HTTP 工具 ---------------- */
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -82,13 +109,223 @@ const MIME: Record<string, string> = {
   '.json': 'application/json',
 }
 
-const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+function sendJson(res: ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(body))
+}
+
+function readBody(req: IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let raw = ''
+    req.on('data', (c) => {
+      raw += c
+      if (raw.length > 1_000_000) {
+        reject(ApiError.bad('请求体过大'))
+        req.destroy()
+      }
+    })
+    req.on('end', () => {
+      if (!raw) return resolve({})
+      try {
+        resolve(JSON.parse(raw))
+      } catch {
+        reject(ApiError.bad('请求体不是合法 JSON'))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+/** 从 Authorization 头解析当前账号 */
+function authenticate(req: IncomingMessage) {
+  const header = req.headers.authorization || ''
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
+  if (!token) throw ApiError.unauthorized()
+  return tenants.requireUser(token)
+}
+
+/* ---------------- REST API ---------------- */
+
+async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+  const p = url.pathname
+  const method = req.method || 'GET'
+  const parts = p.split('/').filter(Boolean) // ['api', ...]
+
+  // 无需鉴权
+  if (p === '/api/auth/login' && method === 'POST') {
+    const body = (await readBody(req)) as LoginRequest
+    const { token, userId } = tenants.login(body.username || '', body.password || '')
+    return sendJson(res, 200, { token, account: tenants.toAccount(tenants.requireAccount(userId)) }), true
+  }
+  if (p === '/api/auth/register' && method === 'POST') {
+    const body = (await readBody(req)) as RegisterRequest
+    const { token, userId } = tenants.register(body.username || '', body.password || '', body.name || '')
+    return sendJson(res, 200, { token, account: tenants.toAccount(tenants.requireAccount(userId)) }), true
+  }
+
+  // 以下全部需要登录
+  const account = authenticate(req)
+
+  if (p === '/api/auth/logout' && method === 'POST') {
+    const token = (req.headers.authorization || '').slice(7).trim()
+    tenants.logout(token)
+    return sendJson(res, 200, { ok: true }), true
+  }
+  if (p === '/api/auth/me' && method === 'GET') {
+    return sendJson(res, 200, { account: tenants.toAccount(account) }), true
+  }
+
+  if (p === '/api/home' && method === 'GET') {
+    const workspaces = tenants.listWorkspacesFor(account.id).map((w) => tenants.toWorkspaceView(w, account.id))
+    const recent = tenants.listRecent(account.id).map(({ rec, doc, role }) => ({
+      doc: tenants.toDocMeta(doc, role),
+      lastVisitedAt: rec.lastVisitedAt,
+    }))
+    return sendJson(res, 200, { account: tenants.toAccount(account), workspaces, recent }), true
+  }
+
+  if (p === '/api/workspaces' && method === 'GET') {
+    const list = tenants.listWorkspacesFor(account.id).map((w) => tenants.toWorkspaceView(w, account.id))
+    return sendJson(res, 200, list), true
+  }
+  if (p === '/api/workspaces' && method === 'POST') {
+    const body = (await readBody(req)) as CreateWorkspaceRequest
+    const ws = tenants.createWorkspace(account.id, body.name || '')
+    return sendJson(res, 201, tenants.toWorkspaceView(ws, account.id)), true
+  }
+
+  // /api/workspaces/:wid/...
+  const wid = parts[2]
+  if (parts[1] === 'workspaces' && wid) {
+    // 工作区详情
+    if (parts.length === 3 && method === 'GET') {
+      tenants.requireMember(wid, account.id)
+      const ws = tenants.getWorkspace(wid)
+      const members = tenants.listMembers(wid).map(({ membership: m, account: a }) => ({
+        userId: a.id,
+        name: a.name,
+        username: a.username,
+        color: a.color,
+        role: m.role,
+      }))
+      const docs = tenants.listAccessibleDocs(account.id, wid).map((d) =>
+        tenants.toDocMeta(d, tenants.effectiveDocRole(wid, d.id, account.id)!),
+      )
+      return (
+        sendJson(res, 200, { workspace: tenants.toWorkspaceView(ws, account.id), members, docs }), true
+      )
+    }
+
+    // 成员管理
+    if (parts.length === 4 && parts[3] === 'members' && method === 'POST') {
+      const body = (await readBody(req)) as AddMemberRequest
+      tenants.addMember(account.id, wid, body.username || '', body.role)
+      return sendJson(res, 200, { ok: true }), true
+    }
+    const memberMatch = parts.length === 5 && parts[3] === 'members'
+    const targetUid = parts[4]
+    if (memberMatch && method === 'PUT') {
+      const body = (await readBody(req)) as UpdateMemberRoleRequest
+      const { changes } = tenants.updateMemberRole(account.id, wid, targetUid, body.role)
+      // 工作区角色变化联动各文档的有效权限（如 admin 降为 member → 失去隐式 manager）
+      for (const ch of changes) {
+        hub.pushDocRole(targetUid, wid, ch.docId, ch.toRole, account.name)
+      }
+      return sendJson(res, 200, { ok: true }), true
+    }
+    if (memberMatch && method === 'DELETE') {
+      const removed = tenants.removeMember(account.id, wid, targetUid)
+      hub.evictFromWorkspace(targetUid, wid, account.name)
+      return sendJson(res, 200, { ok: true, affectedDocs: removed }), true
+    }
+
+    // 文档创建 / 列表
+    if (parts.length === 4 && parts[3] === 'docs' && method === 'POST') {
+      const body = (await readBody(req)) as CreateDocRequest
+      const doc = tenants.createDoc(account.id, wid, body.title || '')
+      return sendJson(res, 201, tenants.toDocMeta(doc, 'manager')), true
+    }
+    if (parts.length === 4 && parts[3] === 'docs' && method === 'GET') {
+      const docs = tenants.listAccessibleDocs(account.id, wid).map((d) =>
+        tenants.toDocMeta(d, tenants.effectiveDocRole(wid, d.id, account.id)!),
+      )
+      return sendJson(res, 200, docs), true
+    }
+
+    // 文档子资源
+    const did = parts[4]
+    if (parts[3] === 'docs' && did) {
+      const sub = parts[5]
+      if (parts.length === 6 && sub === 'boot' && method === 'GET') {
+        const { doc, role } = tenants.requireDocAccess(account.id, wid, decodeURIComponent(did))
+        tenants.touchRecent(account.id, wid, doc.id)
+        const key = sessionKey(wid, doc.id)
+        const live = sessions.get(key)
+        const onlineUsers = live
+          ? live.users().map((u) => ({ userId: u.userId, name: u.name, color: u.color, role: u.role }))
+          : []
+        return (
+          sendJson(res, 200, {
+            doc: tenants.toDocMeta(doc, role),
+            role,
+            workspaceId: wid,
+            onlineUsers,
+          }),
+          true
+        )
+      }
+      if (parts.length === 6 && sub === 'permissions' && method === 'GET') {
+        return sendJson(res, 200, tenants.docPermissionView(account.id, wid, decodeURIComponent(did))), true
+      }
+      if (parts.length === 6 && sub === 'permissions' && method === 'PUT') {
+        const body = (await readBody(req)) as SetDocPermissionRequest
+        const docId = decodeURIComponent(did)
+        const change = tenants.setDocPermission(
+          account.id,
+          wid,
+          docId,
+          body.userId,
+          body.role ?? null,
+        )
+        // 实时通知：被调整者若正在编辑该文档，立即生效 / 踢下线
+        hub.pushDocRole(change.targetUserId, wid, docId, change.toRole, account.name)
+        return sendJson(res, 200, { ok: true, ...change }), true
+      }
+      if (parts.length === 6 && sub === 'audit' && method === 'GET') {
+        return sendJson(res, 200, tenants.listDocAudit(account.id, wid, decodeURIComponent(did))), true
+      }
+    }
+  }
+
+  return false
+}
+
+/* ---------------- HTTP 服务 ---------------- */
+
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, docs: sessions.size }))
+    res.end(JSON.stringify({ ok: true, docs: sessions.size, onlineUsers: hub.onlineUserCount() }))
     return
   }
+
+  if (url.pathname.startsWith('/api/')) {
+    try {
+      const handled = await handleApi(req, res, url)
+      if (!handled) sendJson(res, 404, { error: 'NOT_FOUND', message: '接口不存在' })
+    } catch (e) {
+      if (e instanceof ApiError) {
+        sendJson(res, e.status, { error: e.code, message: e.message })
+      } else {
+        console.error('[api] 处理异常:', e)
+        sendJson(res, 500, { error: 'INTERNAL', message: '服务器内部错误' })
+      }
+    }
+    return
+  }
+
   // 生产模式：托管 client/dist
   let path = normalizePath(decodeURIComponent(url.pathname)).replace(/^(\.\.[/\\])+/, '')
   if (path === '/' || path === '\\') path = '/index.html'
@@ -113,7 +350,7 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
 
 const wss = new WebSocketServer({ server, path: '/ws' })
 
-/** clientId → 连接，用于心跳清理 */
+/** connId → 连接，用于心跳清理 */
 const alive = new Map<string, WebSocket>()
 
 wss.on('connection', (ws: WebSocket) => {
@@ -122,6 +359,8 @@ wss.on('connection', (ws: WebSocket) => {
 
   let session: DocSession | null = null
   let client: ClientState | null = null
+  let workspaceId = ''
+  let userId = ''
 
   const send = (msg: ServerMsg | object) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -143,13 +382,44 @@ wss.on('connection', (ws: WebSocket) => {
     try {
       switch (msg.type) {
         case 'join': {
-          // 重复 join：先清理旧会话
-          if (session && client) {
-            session.removeClient(client.clientId)
-            session.broadcastAll({ type: 'presence', users: session.users() })
+          // 身份解析 + 文档鉴权（进入编辑器前权限已由 REST boot 预加载，此处为权威校验）
+          let account
+          let access
+          try {
+            account = tenants.requireUser(msg.token || '')
+            access = tenants.requireDocAccess(account.id, msg.workspaceId, msg.docId)
+          } catch (e) {
+            if (e instanceof ApiError) {
+              send({ type: 'error', code: e.code === 'UNAUTHORIZED' ? 'UNAUTHORIZED' : 'FORBIDDEN', message: e.message })
+              ws.close(e.code === 'UNAUTHORIZED' ? 4001 : CLOSE_REVOKED, e.message)
+            } else {
+              send({ type: 'error', code: 'INTERNAL', message: '加入失败' })
+            }
+            return
           }
-          session = getSession(msg.docId || 'demo')
-          client = session.addClient(connId, msg.name, msg.role, send)
+
+          // 重复 join（同连接切换/重加入）：先摘除旧绑定
+          const old = hub.get(connId)
+          if (old?.binding) {
+            const b = hub.unregister(connId)
+            b?.session.broadcastAll({ type: 'presence', users: b.session.users() })
+          }
+
+          workspaceId = msg.workspaceId
+          userId = account.id
+          session = getSession(access.doc.workspaceId, access.doc.id)
+          if (!hub.get(connId)) hub.register(connId, account.id, ws, send)
+          client = session.addClient({
+            clientId: connId,
+            userId: account.id,
+            name: account.name,
+            role: access.role,
+            color: account.color,
+            send,
+          })
+          hub.bind(connId, { workspaceId: access.doc.workspaceId, docId: access.doc.id, session })
+          tenants.touchRecent(account.id, access.doc.workspaceId, access.doc.id)
+
           const lastRevision = typeof msg.lastRevision === 'number' ? msg.lastRevision : -1
           const resync = session.buildResync(lastRevision)
           if (resync.kind === 'ops') {
@@ -157,7 +427,9 @@ wss.on('connection', (ws: WebSocket) => {
             send({
               type: 'welcome',
               clientId: connId,
-              docId: session.docId,
+              userId: account.id,
+              workspaceId: access.doc.workspaceId,
+              docId: access.doc.id,
               revision: session.revision,
               doc: '',
               annotations: [...session.annotations.values()],
@@ -183,7 +455,9 @@ wss.on('connection', (ws: WebSocket) => {
             send({
               type: 'welcome',
               clientId: connId,
-              docId: session.docId,
+              userId: account.id,
+              workspaceId: access.doc.workspaceId,
+              docId: access.doc.id,
               revision: session.revision,
               doc: session.doc,
               annotations: [...session.annotations.values()],
@@ -194,7 +468,9 @@ wss.on('connection', (ws: WebSocket) => {
             } satisfies ServerMsg)
           }
           session.broadcastAll({ type: 'presence', users: session.users() })
-          console.log(`[join] ${client.name} (${client.role}) → ${session.docId}，在线 ${session.clients.size} 人`)
+          console.log(
+            `[join] ${account.name} (${client.role}) → ${access.doc.workspaceId}/${access.doc.id}，在线 ${session.clients.size} 连接`,
+          )
           break
         }
 
@@ -261,6 +537,8 @@ wss.on('connection', (ws: WebSocket) => {
             send({
               type: 'welcome',
               clientId: connId,
+              userId,
+              workspaceId,
               docId: session.docId,
               revision: session.revision,
               doc: session.doc,
@@ -287,10 +565,10 @@ wss.on('connection', (ws: WebSocket) => {
 
   ws.on('close', () => {
     alive.delete(connId)
-    if (session && client) {
-      session.removeClient(client.clientId)
-      session.broadcastAll({ type: 'presence', users: session.users() })
-      console.log(`[leave] ${client.name} 离开 ${session.docId}，在线 ${session.clients.size} 人`)
+    const binding = hub.unregister(connId)
+    if (binding) {
+      binding.session.broadcastAll({ type: 'presence', users: binding.session.users() })
+      console.log(`[leave] 连接 ${connId} 离开，文档在线 ${binding.session.clients.size} 连接`)
     }
   })
 
@@ -324,8 +602,9 @@ export function shutdown() {
   for (const ws of alive.values()) ws.terminate()
   alive.clear()
   for (const t of persistTimers.values()) clearTimeout(t)
+  tenants.shutdown()
   wss.close()
   server.close()
 }
 
-export { server, getSession }
+export { server, getSession, tenants, hub }

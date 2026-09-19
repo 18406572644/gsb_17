@@ -1,11 +1,14 @@
 /**
  * 协同编排层：把 WSClient（连接）/ OTClient（并发控制）/ Pinia stores（状态）粘合起来。
  *
- * 异常链路：
- * - 断网：WSClient 指数退避重连 → 重连后带 lastRevision 重新 join → 服务端增量补发或全量快照；
- * - 消息丢失：广播消息携带 seq，客户端检测空洞主动 resync；ack 超时同样触发 resync；
- * - 状态回滚：服务端日志不足以下发增量时下发快照，客户端丢弃未确认修改并回滚到快照；
- * - 权限/协议错误：服务端 error 消息 → 提示并按需 resync。
+ * 多租户与权限：
+ * - 进入编辑器前先经 REST /boot 预加载权限，WS join 携带令牌由服务端做权威鉴权；
+ * - 管理员在线改权 → perm:update 实时下发：立即更新本地角色、禁用对应能力；
+ *   若被降权（失去编辑）且存在未确认的在途编辑，丢弃本地乐观修改并全量重同步到服务端版本；
+ * - 权限被彻底收回 → perm:update(role=null) / close 4003：停止自动重连，退回工作区首页；
+ * - 所有写操作服务端逐条按「当前」权限复核，本地拦截仅为体验优化。
+ *
+ * 异常链路（不变）：断网指数退避重连 → 增量补齐 / 全量快照；seq 空洞与 ack 超时触发重同步。
  */
 import { ElMessage } from 'element-plus'
 import { apply, diffToOp, isNoop, mapPosition, type Op } from '../../../shared/ot'
@@ -13,20 +16,30 @@ import type {
   Annotation,
   ErrorMsg,
   OpsMsg,
+  PermissionUpdateMsg,
   RemoteOpMsg,
   Role,
   ServerMsg,
   WelcomeMsg,
 } from '../../../shared/protocol'
+import { ROLE_RANK, canAnnotate, canEdit } from '../../../shared/protocol'
 import { WSClient } from '@/ws/wsClient'
 import { OTClient } from '@/ot/otClient'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
+import { useAuthStore } from '@/stores/auth'
 
 type RemoteListener = (op: Op) => void
 
 function genId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+export interface EnterOptions {
+  workspaceId: string
+  docId: string
+  docTitle: string
+  role: Role
 }
 
 class Collab {
@@ -38,6 +51,8 @@ class Collab {
   private cursorTimer: ReturnType<typeof setTimeout> | null = null
   private lastCursorSent = 0
   private joinedOnce = false
+  /** 权限收回回调（App 注册以退回工作区首页） */
+  onAccessRevoked: ((message: string) => void) | null = null
 
   constructor() {
     this.ot = new OTClient({
@@ -56,15 +71,22 @@ class Collab {
       }
     }
     this.ws.onOpen = () => {
-      // 连接建立后立即（重）加入文档，携带本地版本号用于增量补齐
+      // 连接建立后立即（重）加入文档，携带令牌与本地版本号（增量补齐）
       const session = useSessionStore()
+      const auth = useAuthStore()
       this.ws.send({
         type: 'join',
+        workspaceId: session.workspaceId,
         docId: session.docId,
-        name: session.name,
-        role: session.role,
+        token: auth.token,
         lastRevision: this.joinedOnce ? this.ot.revision : undefined,
       })
+    }
+    this.ws.onClose = (code) => {
+      // 4003：服务端因权限收回关闭连接 —— 停止自动重连并退回首页
+      if (code === 4003) {
+        this.handleRevoked('你的文档访问权限已被收回')
+      }
     }
     this.ws.onMessage = (msg) => {
       this.ws.noteAlive()
@@ -80,12 +102,18 @@ class Collab {
     }
   }
 
-  join(docId: string, name: string, role: Role) {
+  /** 进入文档（权限已由 REST boot 预加载） */
+  enter(opts: EnterOptions) {
     const session = useSessionStore()
-    session.docId = docId
-    session.name = name
-    session.role = role
+    const auth = useAuthStore()
+    session.workspaceId = opts.workspaceId
+    session.docId = opts.docId
+    session.docTitle = opts.docTitle
+    session.name = auth.account?.name || ''
+    session.userId = auth.account?.id || ''
+    session.role = opts.role
     session.joined = true
+    session.accessRevoked = false
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     this.ws.connect(`${proto}://${location.host}/ws`)
   }
@@ -115,10 +143,15 @@ class Collab {
     this.ws.connect(`${proto}://${location.host}/ws`)
   }
 
-  /* ---------------- 本地动作 ---------------- */
+  /* ---------------- 本地动作（先做本地权限拦截） ---------------- */
 
   /** 本地编辑：与当前文档 diff 生成操作，乐观应用并进入 OT 队列 */
   localEdit(newText: string) {
+    const session = useSessionStore()
+    if (!canEdit(session.role)) {
+      ElMessage.error('当前权限为「查看/批注」，无法编辑正文')
+      return
+    }
     const doc = useDocStore()
     const op = diffToOp(doc.text, newText)
     if (isNoop(op)) return
@@ -129,14 +162,27 @@ class Collab {
   }
 
   addAnnotation(start: number, end: number, quote: string, text: string) {
+    const session = useSessionStore()
+    if (!canAnnotate(session.role)) {
+      ElMessage.error('当前权限无批注权限')
+      return
+    }
     this.ws.send({ type: 'ann:add', annId: genId('ann'), start, end, quote, text })
   }
 
   replyAnnotation(annId: string, text: string) {
+    if (!canAnnotate(useSessionStore().role)) {
+      ElMessage.error('当前权限无批注权限')
+      return
+    }
     this.ws.send({ type: 'ann:reply', annId, replyId: genId('r'), text })
   }
 
   resolveAnnotation(annId: string, resolved: boolean) {
+    if (!canAnnotate(useSessionStore().role)) {
+      ElMessage.error('当前权限无批注权限')
+      return
+    }
     this.ws.send({ type: 'ann:resolve', annId, resolved })
   }
 
@@ -144,7 +190,7 @@ class Collab {
     this.ws.send({ type: 'ann:delete', annId })
   }
 
-  /** 光标上报：120ms 节流，断线时直接丢弃（易失消息） */
+  /** 光标上报：120ms 节流，断线/无查看权限时直接丢弃（易失消息） */
   sendCursor(start: number, end: number) {
     const now = Date.now()
     const doSend = () => {
@@ -212,7 +258,16 @@ class Collab {
         break
 
       case 'cursor':
-        session.cursors[msg.clientId] = { start: msg.start, end: msg.end }
+        if (msg.start < 0) {
+          // 光标墓碑：对端连接已关闭（同账号多标签时清除其残留光标）
+          delete session.cursors[msg.clientId]
+        } else {
+          session.cursors[msg.clientId] = { userId: msg.userId, start: msg.start, end: msg.end }
+        }
+        break
+
+      case 'perm:update':
+        this.onPermissionUpdate(msg)
         break
 
       case 'error':
@@ -229,6 +284,10 @@ class Collab {
     const doc = useDocStore()
     const wasRejoin = this.joinedOnce
     session.clientId = msg.clientId
+    session.userId = msg.userId
+    session.workspaceId = msg.workspaceId
+    session.docId = msg.docId
+    session.setRole(msg.role) // 重连时以服务端当前权限为准
     session.setUsers(msg.users)
     this.joinedOnce = true
     this.resyncing = true
@@ -244,7 +303,7 @@ class Collab {
       this.ws.clearOutbox()
       this.finishResync()
       if (hadUnsynced) {
-        ElMessage.warning('连接已恢复，但部分未同步的本地修改已回滚（版本过旧）')
+        ElMessage.warning('连接已恢复，但部分未同步的本地修改已回滚（版本过旧或权限变更）')
       } else if (wasRejoin) {
         ElMessage.success('已重新连接并同步到最新版本')
       }
@@ -253,6 +312,46 @@ class Collab {
       doc.annotations = msg.annotations
       if (wasRejoin) ElMessage.success('连接已恢复，正在增量同步')
     }
+  }
+
+  /** 在线权限变更：实时更新角色，降权时回滚在途编辑并重同步 */
+  private onPermissionUpdate(msg: PermissionUpdateMsg) {
+    const session = useSessionStore()
+    if (msg.workspaceId !== session.workspaceId || msg.docId !== session.docId) return
+
+    if (msg.role === null) {
+      this.handleRevoked('你的文档访问权限已被管理员收回')
+      return
+    }
+
+    const oldRole = session.role
+    session.setRole(msg.role)
+    const downgraded = ROLE_RANK[msg.role] < ROLE_RANK[oldRole]
+    const by = msg.operatorName ? `（${msg.operatorName} 调整）` : ''
+
+    if (downgraded) {
+      session.permissionNotice = `权限已变更为「${msg.role}」${by}`
+      ElMessage.warning(session.permissionNotice)
+      // 失去编辑权限但本地有未确认编辑：这些修改不可能再被接受，丢弃并回到服务端版本
+      if (!canEdit(msg.role) && this.ot.pendingCount > 0) {
+        this.forceSnapshotResync('权限已降级，未同步的本地编辑被撤销')
+      }
+      if (!canAnnotate(msg.role)) {
+        // 丢弃断线期间排队、降权后不再允许的批注类消息（op 由 OT 队列单独处理）
+        this.ws.pruneOutbox((m) => typeof m.type === 'string' && m.type.startsWith('ann:'))
+      }
+    } else {
+      ElMessage.success(`权限已提升为「${msg.role}」${by}`)
+      session.permissionNotice = null
+    }
+  }
+
+  private handleRevoked(message: string) {
+    const session = useSessionStore()
+    if (session.accessRevoked) return
+    session.accessRevoked = true
+    this.ws.disconnect()
+    if (this.onAccessRevoked) this.onAccessRevoked(message)
   }
 
   /** 重同步完成：重放本地未确认操作对批注锚点的影响，补发离线队列，恢复状态 */
@@ -287,11 +386,29 @@ class Collab {
     this.ws.send({ type: 'resync', lastRevision: this.ot.revision })
   }
 
+  /** 强制全量快照重同步（降权撤销本地编辑 / 本地版本无法增量收敛时） */
+  private forceSnapshotResync(toast?: string) {
+    this.resyncing = true
+    useDocStore().syncState = 'resyncing'
+    this.ws.clearOutbox()
+    this.ws.send({ type: 'resync', lastRevision: -1 })
+    if (toast) ElMessage.warning(toast)
+  }
+
   private onError(msg: ErrorMsg) {
     switch (msg.code) {
-      case 'PERMISSION_DENIED':
-        ElMessage.error(msg.message)
+      case 'UNAUTHORIZED':
+        this.handleRevoked('登录已失效，请重新登录')
         break
+      case 'FORBIDDEN':
+      case 'PERMISSION_DENIED': {
+        ElMessage.error(msg.message)
+        // 在途编辑被拒（典型：降权竞态）→ 丢弃本地未确认编辑，全量回到服务端版本
+        if (msg.opId && this.ot.pendingCount > 0) {
+          this.forceSnapshotResync()
+        }
+        break
+      }
       case 'RESYNC_REQUIRED':
       case 'BAD_REVISION':
         ElMessage.warning(`${msg.message}，正在重新同步`)

@@ -12,23 +12,24 @@ import { canAnnotate, canEdit } from '../../shared/protocol'
 /** 服务端操作日志保留长度：超出后落后太多的客户端只能走全量快照回滚 */
 export const LOG_LIMIT = 1000
 
-const COLORS = [
-  '#f56c6c',
-  '#e6a23c',
-  '#67c23a',
-  '#409eff',
-  '#9b59b6',
-  '#16a085',
-  '#d35400',
-  '#2c3e50',
-]
-
 export interface ClientState {
+  /** WebSocket 连接 ID（连接级，断线即变） */
   clientId: string
+  /** 账号 ID（稳定身份；同一账号可有多条连接） */
+  userId: string
   name: string
   role: Role
   color: string
   cursor: { start: number; end: number } | null
+  send: (msg: object) => void
+}
+
+export interface AddClientOptions {
+  clientId: string
+  userId: string
+  name: string
+  role: Role
+  color: string
   send: (msg: object) => void
 }
 
@@ -44,7 +45,6 @@ export class DocSession {
   /** 已接受的 opId 集合（幂等去重：ack 丢失导致客户端重发时不重复应用） */
   private acceptedOpIds = new Set<string>()
   private acceptedOpIdQueue: string[] = []
-  private colorIdx = 0
   /** 数据变更回调（用于持久化防抖） */
   onDirty: (() => void) | null = null
 
@@ -57,25 +57,61 @@ export class DocSession {
     this.onDirty?.()
   }
 
-  addClient(clientId: string, name: string, role: Role, send: (msg: object) => void): ClientState {
+  addClient(opts: AddClientOptions): ClientState {
     const state: ClientState = {
-      clientId,
-      name: name.slice(0, 24) || '匿名',
-      role,
-      color: COLORS[this.colorIdx++ % COLORS.length],
+      clientId: opts.clientId,
+      userId: opts.userId,
+      name: opts.name.slice(0, 24) || '匿名',
+      role: opts.role,
+      color: opts.color,
       cursor: null,
-      send,
+      send: opts.send,
     }
-    this.clients.set(clientId, state)
+    this.clients.set(opts.clientId, state)
     return state
   }
 
   removeClient(clientId: string) {
+    const c = this.clients.get(clientId)
     this.clients.delete(clientId)
+    if (c) {
+      // 广播该连接的光标墓碑（start=-1）：同一账号多标签时，其余端据此清除已关闭标签的光标
+      this.broadcastAll({ type: 'cursor', clientId, userId: c.userId, start: -1, end: -1 })
+    }
   }
 
+  getClient(clientId: string) {
+    return this.clients.get(clientId)
+  }
+
+  /** 同一账号的全部在线连接（权限实时推送 / 踢下线用） */
+  clientsByUser(userId: string): ClientState[] {
+    return [...this.clients.values()].filter((c) => c.userId === userId)
+  }
+
+  /**
+   * 运行时变更某账号在本会话全部连接的角色（管理员在线改权）。
+   * 返回是否发生了变化。
+   */
+  setUserRole(userId: string, role: Role): boolean {
+    let changed = false
+    for (const c of this.clients.values()) {
+      if (c.userId === userId && c.role !== role) {
+        c.role = role
+        changed = true
+      }
+    }
+    return changed
+  }
+
+  /** 在线用户：按账号去重（同一账号多标签只显示一个协作者） */
   users(): UserInfo[] {
-    return [...this.clients.values()].map((c) => ({
+    const byUser = new Map<string, ClientState>()
+    for (const c of this.clients.values()) {
+      if (!byUser.has(c.userId)) byUser.set(c.userId, c)
+    }
+    return [...byUser.values()].map((c) => ({
+      userId: c.userId,
       clientId: c.clientId,
       name: c.name,
       role: c.role,
@@ -83,12 +119,17 @@ export class DocSession {
     }))
   }
 
-  /** 向除 exclude 外的所有客户端广播 */
+  /** 向除 exclude 连接外的所有客户端广播 */
   broadcast(msg: object, exclude?: string) {
     for (const c of this.clients.values()) {
       if (c.clientId === exclude) continue
       c.send(msg)
     }
+  }
+
+  /** 向某账号的全部连接发送 */
+  sendToUser(userId: string, msg: object) {
+    for (const c of this.clientsByUser(userId)) c.send(msg)
   }
 
   broadcastAll(msg: object) {
@@ -106,7 +147,7 @@ export class DocSession {
     opId: string,
   ): { code: 'PERMISSION_DENIED' | 'BAD_REVISION' | 'RESYNC_REQUIRED'; message: string } | null {
     if (!canEdit(client.role)) {
-      return { code: 'PERMISSION_DENIED', message: '当前角色无编辑权限' }
+      return { code: 'PERMISSION_DENIED', message: '当前权限无编辑权限' }
     }
     // 幂等：该操作已被接受过（ack 丢失后客户端重发）→ 直接重新确认，不重复应用
     if (this.acceptedOpIds.has(opId)) {
@@ -137,7 +178,7 @@ export class DocSession {
       revision: this.revision,
       op: transformed,
       opId,
-      clientId: client.clientId,
+      clientId: client.userId,
       authorName: client.name,
       lenBefore: this.doc.length,
     }
@@ -163,7 +204,7 @@ export class DocSession {
         revision: entry.revision,
         op: transformed,
         opId,
-        clientId: client.clientId,
+        clientId: client.userId,
         authorName: client.name,
         seq: this.seq,
       },
@@ -188,7 +229,7 @@ export class DocSession {
     msg: { annId: string; start: number; end: number; quote: string; text: string },
   ): { code: 'PERMISSION_DENIED' | 'BAD_MESSAGE'; message: string } | null {
     if (!canAnnotate(client.role)) {
-      return { code: 'PERMISSION_DENIED', message: '当前角色无批注权限' }
+      return { code: 'PERMISSION_DENIED', message: '当前权限无批注权限' }
     }
     const start = Math.max(0, Math.min(msg.start, this.doc.length))
     const end = Math.max(start, Math.min(msg.end, this.doc.length))
@@ -201,7 +242,7 @@ export class DocSession {
       end,
       orphan: start === end,
       quote: (msg.quote || this.doc.slice(start, end)).slice(0, 200),
-      authorId: client.clientId,
+      authorId: client.userId,
       authorName: client.name,
       text: msg.text.trim().slice(0, 2000),
       replies: [],
@@ -220,7 +261,7 @@ export class DocSession {
     msg: { annId: string; replyId: string; text: string },
   ): { code: 'PERMISSION_DENIED' | 'BAD_MESSAGE'; message: string } | null {
     if (!canAnnotate(client.role)) {
-      return { code: 'PERMISSION_DENIED', message: '当前角色无批注权限' }
+      return { code: 'PERMISSION_DENIED', message: '当前权限无批注权限' }
     }
     const ann = this.annotations.get(msg.annId)
     if (!ann || !msg.text?.trim()) {
@@ -228,7 +269,7 @@ export class DocSession {
     }
     ann.replies.push({
       id: msg.replyId,
-      authorId: client.clientId,
+      authorId: client.userId,
       authorName: client.name,
       text: msg.text.trim().slice(0, 2000),
       createdAt: Date.now(),
@@ -244,7 +285,7 @@ export class DocSession {
     msg: { annId: string; resolved: boolean },
   ): { code: 'PERMISSION_DENIED' | 'BAD_MESSAGE'; message: string } | null {
     if (!canAnnotate(client.role)) {
-      return { code: 'PERMISSION_DENIED', message: '当前角色无批注权限' }
+      return { code: 'PERMISSION_DENIED', message: '当前权限无批注权限' }
     }
     const ann = this.annotations.get(msg.annId)
     if (!ann) return { code: 'BAD_MESSAGE', message: '批注不存在' }
@@ -261,9 +302,9 @@ export class DocSession {
   ): { code: 'PERMISSION_DENIED' | 'BAD_MESSAGE'; message: string } | null {
     const ann = this.annotations.get(annId)
     if (!ann) return { code: 'BAD_MESSAGE', message: '批注不存在' }
-    // 仅作者本人或编辑者可删除
-    if (ann.authorId !== client.clientId && !canEdit(client.role)) {
-      return { code: 'PERMISSION_DENIED', message: '仅作者或编辑者可删除批注' }
+    // 仅作者本人或可编辑者（editor/manager）可删除
+    if (ann.authorId !== client.userId && !canEdit(client.role)) {
+      return { code: 'PERMISSION_DENIED', message: '仅作者或可编辑者可删除批注' }
     }
     this.annotations.delete(annId)
     this.seq++
@@ -274,8 +315,11 @@ export class DocSession {
 
   updateCursor(client: ClientState, start: number, end: number) {
     client.cursor = { start, end }
-    // 光标消息易失：不计 seq、不持久化，直接转发
-    this.broadcast({ type: 'cursor', clientId: client.clientId, start, end }, client.clientId)
+    // 光标消息易失：不计 seq、不持久化，按账号转发（同一账号他端不显示自己的光标）
+    this.broadcast(
+      { type: 'cursor', clientId: client.clientId, userId: client.userId, start, end },
+      client.clientId,
+    )
   }
 
   /**

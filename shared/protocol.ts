@@ -4,24 +4,78 @@
  */
 import type { Op } from './ot'
 
-/** 角色：viewer 只读 / commenter 可批注 / editor 可编辑+批注 */
-export type Role = 'viewer' | 'commenter' | 'editor'
+/**
+ * 文档角色（权限自低到高）：
+ * - viewer    查看：只读，可见正文、批注、在线状态
+ * - commenter 批注：在查看基础上可新增/回复/解决批注
+ * - editor    编辑：在批注基础上可修改正文
+ * - manager   管理：在编辑基础上可配置成员权限、查看审计（不参与协同语义外的操作）
+ */
+export type Role = 'viewer' | 'commenter' | 'editor' | 'manager'
+
+/** 角色层级权重，数值越大权限越高 */
+export const ROLE_RANK: Record<Role, number> = {
+  viewer: 0,
+  commenter: 1,
+  editor: 2,
+  manager: 3,
+}
 
 export const ROLE_LABEL: Record<Role, string> = {
-  viewer: '只读',
+  viewer: '查看',
   commenter: '批注',
   editor: '编辑',
+  manager: '管理',
+}
+
+/** 可被授予的细粒度权限点 */
+export type Permission = 'view' | 'comment' | 'edit' | 'manage'
+
+export const PERMISSION_LABEL: Record<Permission, string> = {
+  view: '查看',
+  comment: '批注',
+  edit: '编辑',
+  manage: '管理',
+}
+
+/** 角色 → 其拥有的权限点 */
+const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
+  viewer: ['view'],
+  commenter: ['view', 'comment'],
+  editor: ['view', 'comment', 'edit'],
+  manager: ['view', 'comment', 'edit', 'manage'],
+}
+
+export function roleHas(role: Role, perm: Permission): boolean {
+  return ROLE_PERMISSIONS[role].includes(perm)
+}
+
+export function canView(role: Role): boolean {
+  return roleHas(role, 'view')
 }
 
 export function canEdit(role: Role): boolean {
-  return role === 'editor'
+  return roleHas(role, 'edit')
 }
 
 export function canAnnotate(role: Role): boolean {
-  return role === 'editor' || role === 'commenter'
+  return roleHas(role, 'comment')
 }
 
+export function canManage(role: Role): boolean {
+  return roleHas(role, 'manage')
+}
+
+/** 角色是否不弱于目标角色 */
+export function roleAtLeast(role: Role, target: Role): boolean {
+  return ROLE_RANK[role] >= ROLE_RANK[target]
+}
+
+/** 用户公开信息（在线列表 / 成员选择器使用） */
 export interface UserInfo {
+  /** 账号 ID（稳定标识；同一账号多标签在线时以此去重） */
+  userId: string
+  /** 当前 WebSocket 连接 ID（仅用于光标等连接级状态） */
   clientId: string
   name: string
   role: Role
@@ -66,9 +120,10 @@ export interface LogEntry {
 
 export interface JoinMsg {
   type: 'join'
+  workspaceId: string
   docId: string
-  name: string
-  role: Role
+  /** 登录后获得的会话令牌；服务端据此解析身份并鉴权 */
+  token: string
   /** 断线重连时携带本地已同步到的版本号，用于增量补齐 */
   lastRevision?: number
 }
@@ -140,6 +195,8 @@ export type ClientMsg =
 export interface WelcomeMsg {
   type: 'welcome'
   clientId: string
+  userId: string
+  workspaceId: string
   docId: string
   revision: number
   doc: string
@@ -186,7 +243,10 @@ export interface PresenceMsg {
 
 export interface RemoteCursorMsg {
   type: 'cursor'
+  /** 连接 ID（光标定位键） */
   clientId: string
+  /** 账号 ID（用于着色 / 与在线列表匹配） */
+  userId: string
   start: number
   end: number
 }
@@ -203,11 +263,32 @@ export interface AnnDeletedMsg {
   seq: number
 }
 
+/**
+ * 在线权限变更推送：管理员调整权限后实时下发给受影响用户的全部在线连接。
+ * 客户端收到后立即更新本地角色、禁用对应能力；
+ * 若降权导致存在未确认的越权编辑，需回滚并重同步。
+ */
+export interface PermissionUpdateMsg {
+  type: 'perm:update'
+  workspaceId: string
+  docId: string
+  /** 新的有效角色；null 表示权限被彻底收回 */
+  role: Role | null
+  /** 触发本次变更的管理员名（用于提示） */
+  operatorName?: string
+  /** 该消息独立即时处理，不参与文档 op 的 seq 可靠性流 */
+  seq?: number
+}
+
 export type ServerErrorCode =
   | 'PERMISSION_DENIED'
+  | 'UNAUTHORIZED'
+  | 'FORBIDDEN'
+  | 'NOT_FOUND'
   | 'BAD_REVISION'
   | 'RESYNC_REQUIRED'
   | 'BAD_MESSAGE'
+  | 'CONFLICT'
   | 'INTERNAL'
 
 export interface ErrorMsg {
@@ -231,5 +312,6 @@ export type ServerMsg =
   | RemoteCursorMsg
   | AnnUpsertMsg
   | AnnDeletedMsg
+  | PermissionUpdateMsg
   | ErrorMsg
   | PongMsg

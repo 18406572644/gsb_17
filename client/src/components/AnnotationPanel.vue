@@ -42,7 +42,7 @@ async function remove(ann: Annotation) {
 }
 
 function canDelete(ann: Annotation) {
-  return ann.authorId === session.clientId || session.canEdit
+  return ann.authorId === session.userId || session.canEdit
 }
 
 function reply(ann: Annotation) {

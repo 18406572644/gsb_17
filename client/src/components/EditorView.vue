@@ -33,7 +33,7 @@ function caretHtml(name: string, color: string): string {
 const highlightHtml = computed(() => {
   const text = doc.text
   const anns = doc.annotations
-  const me = session.clientId
+  const me = session.userId
 
   const bounds = new Set<number>([0, text.length])
   for (const a of anns) {
@@ -41,12 +41,12 @@ const highlightHtml = computed(() => {
     bounds.add(a.end)
   }
 
-  // 远程选区与光标
+  // 远程选区与光标（按连接渲染，按账号匹配颜色/昵称）
   const remoteSels: { start: number; end: number; color: string }[] = []
   const carets = new Map<number, { name: string; color: string }[]>()
   for (const [cid, c] of Object.entries(session.cursors)) {
-    if (cid === me) continue
-    const u = session.users.find((x) => x.clientId === cid)
+    if (c.userId === me) continue
+    const u = session.users.find((x) => x.userId === c.userId)
     if (!u) continue
     const s = Math.max(0, Math.min(c.start, c.end, text.length))
     const e = Math.max(0, Math.min(Math.max(c.start, c.end), text.length))

@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { ElMessageBox } from 'element-plus'
+import { computed, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
 import { collab } from '@/collab/collab'
 import { ROLE_LABEL } from '../../../shared/protocol'
 import UserAvatar from '@/components/UserAvatar.vue'
+import PermissionDialog from '@/components/PermissionDialog.vue'
+import type { DocMeta } from '../../../shared/api'
 
 const session = useSessionStore()
 const doc = useDocStore()
+const permVisible = ref(false)
 
 const connTag = computed(() => {
   switch (session.status) {
@@ -35,10 +38,26 @@ const syncTag = computed(() => {
 })
 
 const roleTagType = computed(() => {
-  if (session.role === 'editor') return 'primary'
-  if (session.role === 'commenter') return 'warning'
-  return 'info'
+  switch (session.role) {
+    case 'manager':
+      return 'danger'
+    case 'editor':
+      return 'primary'
+    case 'commenter':
+      return 'warning'
+    default:
+      return 'info'
+  }
 })
+
+const docMeta = computed<DocMeta>(() => ({
+  id: session.docId,
+  workspaceId: session.workspaceId,
+  title: session.docTitle,
+  updatedAt: 0,
+  createdAt: 0,
+  myRole: session.role,
+}))
 
 function toggleOffline() {
   if (session.status === 'offline') {
@@ -48,9 +67,9 @@ function toggleOffline() {
   }
 }
 
-async function quit() {
+async function backHome() {
   try {
-    await ElMessageBox.confirm('确定离开文档吗？', '退出', { type: 'warning' })
+    await ElMessageBox.confirm('返回工作区首页？协同编辑将断开。', '返回', { type: 'info' })
   } catch {
     return
   }
@@ -60,7 +79,8 @@ async function quit() {
 
 <template>
   <div class="topbar">
-    <span class="doc-title">📄 {{ session.docId }}</span>
+    <el-button size="small" plain @click="backHome">← 工作区</el-button>
+    <span class="doc-title">📄 {{ session.docTitle }}</span>
     <el-tag size="small" :type="connTag.type" effect="light">{{ connTag.text }}</el-tag>
     <el-tag size="small" :type="syncTag.type" effect="plain">{{ syncTag.text }}</el-tag>
     <el-tag size="small" :type="roleTagType" effect="dark">{{ ROLE_LABEL[session.role] }}</el-tag>
@@ -68,11 +88,15 @@ async function quit() {
 
     <div class="spacer" />
 
+    <el-button v-if="session.canManage" size="small" type="danger" plain @click="permVisible = true">
+      成员权限
+    </el-button>
+
     <div class="user-avatars">
       <el-tooltip
         v-for="u in session.users"
-        :key="u.clientId"
-        :content="`${u.name}（${ROLE_LABEL[u.role]}）${u.clientId === session.clientId ? ' - 我' : ''}`"
+        :key="u.userId"
+        :content="`${u.name}（${ROLE_LABEL[u.role]}）${u.userId === session.userId ? ' - 我' : ''}`"
         placement="bottom"
       >
         <UserAvatar :user="u" />
@@ -87,6 +111,13 @@ async function quit() {
     >
       {{ session.status === 'offline' ? '重新连接' : '模拟断线' }}
     </el-button>
-    <el-button size="small" plain @click="quit">退出</el-button>
+
+    <PermissionDialog v-if="permVisible" :doc="docMeta" @close="permVisible = false" />
   </div>
 </template>
+
+<style scoped>
+.spacer {
+  flex: 1;
+}
+</style>
